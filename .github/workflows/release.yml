@@ -35,7 +35,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: ProxmoxBackupManager
-          path: dist/*
+          path: dist/ProxmoxBackupManager-Setup-*.exe
 
       - name: Attach to release
         if: startsWith(github.ref, 'refs/tags/')
@@ -45,4 +45,4 @@ jobs:
         run: |
           gh release view "${{ github.ref_name }}" 2>$null
           if ($LASTEXITCODE -ne 0) { gh release create "${{ github.ref_name }}" --title "${{ github.ref_name }}" --notes-file RELEASE_NOTES.md }
-          gh release upload "${{ github.ref_name }}" dist/ProxmoxBackupManager.exe dist/ProxmoxBackupManager-Setup-*.exe --clobber
+          gh release upload "${{ github.ref_name }}" (Get-Item dist/ProxmoxBackupManager-Setup-*.exe).FullName --clobber

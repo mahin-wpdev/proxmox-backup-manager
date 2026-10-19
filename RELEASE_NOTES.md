@@ -1,6 +1,6 @@
 ## Proxmox Backup Manager 2.0.0
 
-**Download:** `ProxmoxBackupManager-Setup-2.0.0.exe` (installer) or `ProxmoxBackupManager.exe` (portable).
+**Download:** `ProxmoxBackupManager-Setup-2.0.0.exe` and run it to install.
 
 ### New
 - New modern UI with a sidebar, a dark/light theme and a dashboard (CPU, RAM, disk, uptime, last backup).

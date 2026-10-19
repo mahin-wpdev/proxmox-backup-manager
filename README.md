@@ -5,9 +5,7 @@ A free, easy Windows app for backing up **any Proxmox VE server** to your own PC
 ![icon](assets/icon.png)
 
 ## Download
-Go to the [Releases](../../releases/latest) page and pick one:
-- **`ProxmoxBackupManager-Setup-x.y.z.exe`**: the installer (recommended). Adds Start menu and desktop shortcuts, and an uninstaller.
-- **`ProxmoxBackupManager.exe`**: the portable version. No install, just run it.
+Go to the [Releases](../../releases/latest) page, download **`ProxmoxBackupManager-Setup-x.y.z.exe`** and run it. The installer adds Start menu and desktop shortcuts, and an uninstaller.
 
 ## Features
 **Login**
@@ -79,7 +77,7 @@ Need something? [Open an issue](../../issues/new) and describe it.
 pip install -r requirements.txt
 python proxmox_backup_manager.py
 ```
-Each `v*` tag is built by GitHub Actions (`.github/workflows/release.yml`), which produces the portable exe and the Inno Setup installer.
+Each `v*` tag is built by GitHub Actions (`.github/workflows/release.yml`), which produces the Inno Setup installer.
 
 ## Notes
 - Settings are stored in `%APPDATA%\ProxmoxBackupManager\config.json`.
