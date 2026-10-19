@@ -1,15 +1,14 @@
-﻿## Proxmox Backup Manager 2.0.2
+﻿## Proxmox Backup Manager 2.0.3
 
-**Download:** `ProxmoxBackupManager-Setup-2.0.2.exe` and run it to install (it updates older versions in place).
+**Download:** `ProxmoxBackupManager-Setup-2.0.3.exe` and run it to install (it updates older versions in place).
 
 ### Fixes
-- **Backups failed immediately** with `App.ui() got an unexpected keyword argument 'text'`. Fixed, and a progress-display problem can no longer stop a backup.
-- **Broken icons and symbols** (text like `â€¢` and `ðŸ“Š`) in 2.0.1. Fixed.
-- If a backup fails or is cancelled, the job on the Proxmox server is stopped too, so nothing is left running.
+- **Updating no longer gets stuck on "Setup was unable to automatically close all applications".** If the app is open, Setup asks once and then closes it itself. Uninstall also closes it.
 
-### From 2.0.1
-- Progress shows right away. If another backup is already running on the server, the app says **"Waiting: another backup is running"**.
-- The app warns you before starting a backup when one is already running on the server.
-- Each backup run uses its own log file.
+### From 2.0.2
+- Fixed backups failing immediately (`App.ui() got an unexpected keyword argument 'text'`).
+- Fixed broken icons and symbols.
+- If a backup fails or is cancelled, the job on the Proxmox server is stopped too.
+- Shows "Waiting: another backup is running" when the server is busy, and warns before starting a second backup.
 
 Feature requests: https://github.com/mahin-wpdev/proxmox-backup-manager/issues

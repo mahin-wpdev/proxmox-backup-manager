@@ -30,7 +30,7 @@ except ImportError:  # theme is optional
     sv_ttk = None
 
 APP_NAME = "Proxmox Backup Manager"
-VERSION = "2.0.2"
+VERSION = "2.0.3"
 TASK_NAME = "Proxmox Auto Backup"
 CONFIG_DIR = Path(os.environ.get("APPDATA", Path.home())) / "ProxmoxBackupManager"
 CONFIG_FILE = CONFIG_DIR / "config.json"
