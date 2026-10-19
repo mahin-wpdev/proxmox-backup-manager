@@ -18,6 +18,9 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Check source text is not corrupted
+        run: python -c "import sys; t=open('proxmox_backup_manager.py',encoding='utf-8').read(); bad=[s for s in ('â€','ðŸ','Â·') if s in t]; sys.exit('Corrupted (double-encoded) text found' if bad else 0)"
+
       - name: Install dependencies
         run: pip install -r requirements.txt pyinstaller
 

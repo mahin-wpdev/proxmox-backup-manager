@@ -2,7 +2,7 @@
 ; Build: iscc /DAppVersion=2.0.0 installer.iss   (expects dist\ProxmoxBackupManager.exe)
 
 #ifndef AppVersion
-  #define AppVersion "2.0.1"
+  #define AppVersion "2.0.2"
 #endif
 
 [Setup]
