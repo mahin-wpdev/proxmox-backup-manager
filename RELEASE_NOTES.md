@@ -1,18 +1,11 @@
-## Proxmox Backup Manager 2.0.0
+﻿## Proxmox Backup Manager 2.0.1
 
-**Download:** `ProxmoxBackupManager-Setup-2.0.0.exe` and run it to install.
+**Download:** `ProxmoxBackupManager-Setup-2.0.1.exe` and run it to install (it updates 2.0.0 in place).
 
-### New
-- New modern UI with a sidebar, a dark/light theme and a dashboard (CPU, RAM, disk, uptime, last backup).
-- Windows installer with Start menu and desktop shortcuts, and an uninstaller.
-- Remember login details. The password is encrypted with Windows DPAPI. Optional auto-login.
-- Live backup progress: % done, GB of total GB, speed, time left, and an overall bar.
-- Snapshots: take, roll back, delete.
-- Open the VM console and the web UI in your browser, and open an SSH terminal.
-- Restore a backup on the server, or upload a local backup and restore it.
-- Check for updates, and reboot or shut down the node.
-- Keyboard shortcuts (press F1 in the app).
-- Auto backup now covers every saved server, and can use a saved password or an SSH key.
-- Works with Proxmox clusters: backs up guests on other nodes too.
+### Fixes
+- Progress now shows right away. If another backup is already running on the server, the app says **"Waiting: another backup is running"** instead of showing nothing.
+- The app warns you before starting a backup when one is already running on the server.
+- **Cancel now also stops the backup on the Proxmox server**, not just in the app.
+- Each backup run uses its own log file, so two backups can no longer mix up each other's results.
 
 Feature requests: https://github.com/mahin-wpdev/proxmox-backup-manager/issues

@@ -1,4 +1,4 @@
-"""
+﻿"""
 Proxmox Backup Manager
 Windows desktop app to manage any Proxmox VE host over SSH and back it up to this PC.
 
@@ -30,7 +30,7 @@ except ImportError:  # theme is optional
     sv_ttk = None
 
 APP_NAME = "Proxmox Backup Manager"
-VERSION = "2.0.0"
+VERSION = "2.0.1"
 TASK_NAME = "Proxmox Auto Backup"
 CONFIG_DIR = Path(os.environ.get("APPDATA", Path.home())) / "ProxmoxBackupManager"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -59,7 +59,7 @@ SHORTCUTS = [
     ("Ctrl+O", "Open VM console in browser"),
     ("Ctrl+W", "Open Proxmox web UI"),
     ("Ctrl+T", "Open SSH terminal"),
-    ("Ctrl+1 … Ctrl+6", "Switch page"),
+    ("Ctrl+1 â€¦ Ctrl+6", "Switch page"),
     ("Esc", "Cancel running job"),
     ("Ctrl+L", "Log out"),
     ("F1", "Show shortcuts"),
@@ -239,50 +239,80 @@ done"""
     # --- transfers
     def stream_backup(self, g, dest, mode="snapshot", progress=None, cancel=None):
         """Run vzdump on the node and stream the compressed result into dest.
-        progress(pct or None, bytes_received, speed)"""
+        progress(pct or None, bytes_received, speed, status)  status: 'waiting' | 'starting' | None"""
         gid = int(g["id"])
-        log = f"/tmp/pbm-vzdump-{gid}.log"
+        tag = f"/tmp/pbm-{gid}-{int(time.time())}-{os.getpid()}"
+        log, pidf = tag + ".log", tag + ".pid"
         comp = "zstd -T0 -3" if self.has_zstd() else "gzip -1"
-        cmd = f"vzdump {gid} --stdout --mode {shlex.quote(mode)} 2>{log} | {comp}"
+        inner = f"vzdump {gid} --stdout --mode {shlex.quote(mode)} 2>{log} | {comp}"
         if g.get("node") and g["node"] != self.node:  # guest lives on another cluster node
-            cmd = f"ssh -o BatchMode=yes root@{shlex.quote(g['node'])} {shlex.quote(cmd)}; ssh root@{shlex.quote(g['node'])} cat {log} > {log}"
-        self.run(f"rm -f {log}")
+            inner = (f"ssh -o BatchMode=yes root@{shlex.quote(g['node'])} {shlex.quote(inner)}; "
+                     f"ssh root@{shlex.quote(g['node'])} cat {log} > {log}")
+        cmd = f"echo $$ > {pidf}; {inner}"
         chan = self.client.get_transport().open_session()
         chan.exec_command(cmd)
-        state = {"pct": None}
+        chan.settimeout(1.0)
+        state = {"pct": None, "status": "starting"}
         stop = threading.Event()
 
         def watch_log():
             rx = re.compile(r"INFO:\s+(\d+)% \(")
             while not stop.wait(2):
                 try:
-                    tail = self.run(f"tail -c 2000 {log} 2>/dev/null", timeout=20)[1]
+                    tail = self.run(f"tail -c 3000 {log} 2>/dev/null", timeout=20)[1]
                     m = rx.findall(tail)
                     if m:
-                        state["pct"] = int(m[-1])
+                        state["pct"], state["status"] = int(m[-1]), None
+                    elif "global lock - waiting" in tail and "got global lock" not in tail:
+                        state["status"] = "waiting"
+                    elif tail:
+                        state["status"] = "starting"
                 except Exception:
                     pass
         threading.Thread(target=watch_log, daemon=True).start()
 
-        done, start = 0, time.time()
+        def kill_remote():
+            self.run(f"p=$(cat {pidf} 2>/dev/null) && [ -n \"$p\" ] && pkill -TERM -P $p; sleep 2; "
+                     f"p=$(cat {pidf} 2>/dev/null) && [ -n \"$p\" ] && pkill -KILL -P $p", timeout=30)
+
+        done, start, last = 0, time.time(), 0
         try:
             with open(dest, "wb") as f:
                 while True:
                     if cancel and cancel.is_set():
+                        kill_remote()
                         chan.close()
                         raise RuntimeError("Cancelled")
-                    data = chan.recv(CHUNK)
-                    if not data:
+                    try:
+                        data = chan.recv(CHUNK)
+                    except TimeoutError:
+                        data = None
+                    except Exception as e:  # socket.timeout on older Pythons
+                        if "timed out" not in str(e):
+                            raise
+                        data = None
+                    if data == b"":
                         break
-                    f.write(data)
-                    done += len(data)
-                    if progress:
-                        progress(state["pct"], done, done / max(time.time() - start, 0.001))
+                    if data:
+                        if not done:
+                            start = time.time()
+                        f.write(data)
+                        done += len(data)
+                    now = time.time()
+                    if progress and now - last > 0.3:
+                        last = now
+                        progress(state["pct"], done, done / max(now - start, 0.001) if done else 0, state["status"])
             chan.recv_exit_status()
         finally:
             stop.set()
-        out = self.run(f"cat {log}")[1]
+            self.run(f"rm -f {pidf}")
+        out = self.run(f"cat {log}; rm -f {log}")[1]
         return "Finished Backup" in out, out
+
+    def running_backups(self):
+        """Command lines of vzdump jobs currently running or queued on this node."""
+        out = self.run("ps -eo args | grep '^/usr/bin/perl -T /usr/bin/vzdump' | grep -v grep")[1]
+        return [l.replace("/usr/bin/perl -T /usr/bin/", "").strip() for l in out.splitlines() if l.strip()]
 
     def download(self, remote, dest, progress=None, cancel=None):
         sftp = self.client.open_sftp()
@@ -335,7 +365,7 @@ done"""
 # ----------------------------------------------------------------- backup job
 def full_backup(pve, cfg, log, progress=None, cancel=None, guests=None):
     """Back up host config + guests into backup_dir/<host>/<date>. Returns failure count.
-    progress(item_label, item_pct, item_bytes, speed, overall_pct, index, count, item_total)"""
+    progress(item_label, item_pct, item_bytes, speed, overall_pct, index, count, item_total, status)"""
     root = Path(cfg["backup_dir"]) / pve.host.replace(":", "_")
     full = guests is None
     date = datetime.now().strftime("%Y-%m-%d") if full else "manual/" + datetime.now().strftime("%Y-%m-%d_%H%M")
@@ -358,11 +388,11 @@ def full_backup(pve, cfg, log, progress=None, cancel=None, guests=None):
         dest = target / f"vzdump-{g['type']}-{g['id']}-{g['name']}.{pve.ext(g['type'])}"
         log(f"[{i}/{len(guests)}] {g['id']} {g['name']}  (disk {human(g['disk'])})")
 
-        def prog(pct, got, speed, g=g, i=i):
+        def prog(pct, got, speed, status=None, g=g, i=i):
             if progress:
                 cur = g["disk"] * (pct or 0) / 100
                 progress(f"{g['id']} {g['name']}", pct, got, speed,
-                         (finished + cur) * 100 / total, i, len(guests), g["disk"])
+                         (finished + cur) * 100 / total, i, len(guests), g["disk"], status)
         try:
             ok, _ = pve.stream_backup(g, dest, cfg.get("mode", "snapshot"), prog, cancel)
         except Exception as e:
@@ -483,7 +513,7 @@ class App(tk.Tk):
         outer.pack(fill="both", expand=True)
         card = ttk.Frame(outer, padding=36)
         card.place(relx=0.5, rely=0.5, anchor="center")
-        ttk.Label(card, text="🖥  " + APP_NAME, style="Title.TLabel").grid(row=0, column=0, columnspan=2, pady=(0, 4))
+        ttk.Label(card, text="ðŸ–¥  " + APP_NAME, style="Title.TLabel").grid(row=0, column=0, columnspan=2, pady=(0, 4))
         ttk.Label(card, text="Back up any Proxmox VE server to this PC", style="Muted.TLabel").grid(row=1, column=0, columnspan=2, pady=(0, 22))
 
         self.v_host = tk.StringVar(value=self.cfg.get("host", ""))
@@ -502,7 +532,7 @@ class App(tk.Tk):
         field(2, "Proxmox IP / host", self.cb_host)
         field(3, "SSH port", ttk.Entry(card, textvariable=self.v_port, width=32))
         field(4, "Username", ttk.Entry(card, textvariable=self.v_user, width=32))
-        pw = ttk.Entry(card, textvariable=self.v_pass, width=32, show="•")
+        pw = ttk.Entry(card, textvariable=self.v_pass, width=32, show="â€¢")
         pw.bind("<Return>", lambda _: self.do_login())
         field(5, "Password", pw)
         ttk.Checkbutton(card, text="Remember login details (password encrypted on this PC)",
@@ -541,7 +571,7 @@ class App(tk.Tk):
         if not host:
             return self.login_msg.config(text="Enter the Proxmox IP.")
         self.btn_login.state(["disabled"])
-        self.login_msg.config(text="Connecting…", foreground="#8b93a7")
+        self.login_msg.config(text="Connectingâ€¦", foreground="#8b93a7")
         user, port, pw = self.v_user.get().strip() or "root", int(self.v_port.get() or 22), self.v_pass.get()
 
         def work():
@@ -570,7 +600,7 @@ class App(tk.Tk):
         self.main.pack(fill="both", expand=True)
         self.lbl_server.config(text=f"{pve.user}@{pve.host}")
         self.file_sizes = {}
-        self.lbl_ver.config(text=f"node {pve.node} · PVE {ver.split('/')[1] if '/' in ver else ver}")
+        self.lbl_ver.config(text=f"node {pve.node} Â· PVE {ver.split('/')[1] if '/' in ver else ver}")
         self.show_page("dashboard")
         self.refresh()
 
@@ -582,9 +612,9 @@ class App(tk.Tk):
         ttk.Label(side, text="Proxmox", style="H2.TLabel").pack(anchor="w", padx=8)
         ttk.Label(side, text="Backup Manager", style="Muted.TLabel").pack(anchor="w", padx=8, pady=(0, 16))
         self.nav = {}
-        for key, label in [("dashboard", "📊  Dashboard"), ("guests", "🖥  VMs & Containers"),
-                           ("server", "🗄  Backups on server"), ("local", "💾  Backups on this PC"),
-                           ("storage", "📦  Storage"), ("settings", "⚙  Auto backup & settings")]:
+        for key, label in [("dashboard", "ðŸ“Š  Dashboard"), ("guests", "ðŸ–¥  VMs & Containers"),
+                           ("server", "ðŸ—„  Backups on server"), ("local", "ðŸ’¾  Backups on this PC"),
+                           ("storage", "ðŸ“¦  Storage"), ("settings", "âš™  Auto backup & settings")]:
             b = ttk.Button(side, text=label, style="Nav.TButton", command=lambda k=key: self.show_page(k))
             b.pack(fill="x", pady=2)
             self.nav[key] = b
@@ -593,9 +623,9 @@ class App(tk.Tk):
         self.lbl_server.pack(anchor="w", padx=8)
         self.lbl_ver = ttk.Label(side, text="", style="Muted.TLabel")
         self.lbl_ver.pack(anchor="w", padx=8, pady=(0, 8))
-        ttk.Button(side, text="⌨  Shortcuts (F1)", command=self.show_shortcuts).pack(fill="x", pady=2)
-        ttk.Button(side, text="◐  Light / dark", command=self.toggle_theme).pack(fill="x", pady=2)
-        ttk.Button(side, text="⎋  Log out", command=self.do_logout).pack(fill="x", pady=2)
+        ttk.Button(side, text="âŒ¨  Shortcuts (F1)", command=self.show_shortcuts).pack(fill="x", pady=2)
+        ttk.Button(side, text="â—  Light / dark", command=self.toggle_theme).pack(fill="x", pady=2)
+        ttk.Button(side, text="âŽ‹  Log out", command=self.do_logout).pack(fill="x", pady=2)
 
         ttk.Separator(main, orient="vertical").pack(side="left", fill="y")
         right = ttk.Frame(main)
@@ -661,7 +691,7 @@ class App(tk.Tk):
     # ---------- pages
     def _page_dashboard(self):
         f, head = self._page("Dashboard")
-        ttk.Button(head, text="⟳ Refresh", command=self.refresh).pack(side="right")
+        ttk.Button(head, text="âŸ³ Refresh", command=self.refresh).pack(side="right")
         grid = ttk.Frame(f)
         grid.pack(fill="x")
         self.stats = {}
@@ -669,7 +699,7 @@ class App(tk.Tk):
                                           ("vms", "VMs running"), ("uptime", "Uptime"), ("last", "Last PC backup")]):
             card = ttk.LabelFrame(grid, text=label, padding=14)
             card.grid(row=i // 3, column=i % 3, sticky="nsew", padx=6, pady=6)
-            v = ttk.Label(card, text="–", style="Stat.TLabel")
+            v = ttk.Label(card, text="â€“", style="Stat.TLabel")
             v.pack(anchor="w")
             sub = ttk.Label(card, text="", style="Muted.TLabel")
             sub.pack(anchor="w")
@@ -682,9 +712,9 @@ class App(tk.Tk):
 
         q = ttk.LabelFrame(f, text="Quick actions", padding=14)
         q.pack(fill="x", pady=(12, 0), padx=6)
-        acts = [("💾 Backup ALL to PC", self.backup_all, 1), ("🌐 Open web UI", self.open_web),
-                ("⌨ SSH terminal", self.open_ssh), ("🔄 Check for updates", self.check_updates),
-                ("⏻ Reboot node", lambda: self.node_power("reboot")), ("⏼ Shut down node", lambda: self.node_power("shutdown"))]
+        acts = [("ðŸ’¾ Backup ALL to PC", self.backup_all, 1), ("ðŸŒ Open web UI", self.open_web),
+                ("âŒ¨ SSH terminal", self.open_ssh), ("ðŸ”„ Check for updates", self.check_updates),
+                ("â» Reboot node", lambda: self.node_power("reboot")), ("â¼ Shut down node", lambda: self.node_power("shutdown"))]
         for i, (text, cmd, *acc) in enumerate(acts):
             ttk.Button(q, text=text, command=cmd, style="Accent.TButton" if acc else "TButton").grid(
                 row=i // 3, column=i % 3, padx=4, pady=4, sticky="ew")
@@ -694,16 +724,16 @@ class App(tk.Tk):
 
     def _page_guests(self):
         f, _ = self._page("VMs & Containers", "right-click a VM for more")
-        self._toolbar(f, [("💾 Backup selected (Ctrl+B)", self.backup_selected, 1), ("Backup ALL", self.backup_all), None,
-                          ("▶ Start", lambda: self.guest_action("start")), ("⏹ Shutdown", lambda: self.guest_action("shutdown")),
-                          ("⏼ Stop", lambda: self.guest_action("stop")), ("↻ Reboot", lambda: self.guest_action("reboot")), None,
-                          ("📷 Snapshots", self.open_snapshots), ("🖥 Console", self.open_console)])
+        self._toolbar(f, [("ðŸ’¾ Backup selected (Ctrl+B)", self.backup_selected, 1), ("Backup ALL", self.backup_all), None,
+                          ("â–¶ Start", lambda: self.guest_action("start")), ("â¹ Shutdown", lambda: self.guest_action("shutdown")),
+                          ("â¼ Stop", lambda: self.guest_action("stop")), ("â†» Reboot", lambda: self.guest_action("reboot")), None,
+                          ("ðŸ“· Snapshots", self.open_snapshots), ("ðŸ–¥ Console", self.open_console)])
         self.tree_guests = self._tree(f, ("ID", "Name", "Type", "Status", "CPU", "RAM", "Disk", "Uptime", "Node"),
                                       (70, 230, 70, 90, 70, 150, 100, 100, 100),
                                       ("center", "w", "center", "center", "e", "e", "e", "e", "w"))
         self.tree_guests.bind("<Double-1>", lambda _: self.open_console())
         menu = tk.Menu(self, tearoff=0)
-        for text, cmd in [("Backup to PC", self.backup_selected), ("Snapshots…", self.open_snapshots),
+        for text, cmd in [("Backup to PC", self.backup_selected), ("Snapshotsâ€¦", self.open_snapshots),
                           ("Open console", self.open_console), (None, None), ("Start", lambda: self.guest_action("start")),
                           ("Shutdown", lambda: self.guest_action("shutdown")), ("Reboot", lambda: self.guest_action("reboot")),
                           ("Stop (force)", lambda: self.guest_action("stop"))]:
@@ -719,17 +749,17 @@ class App(tk.Tk):
 
     def _page_server(self):
         f, _ = self._page("Backups on server", "backup files stored on Proxmox storages")
-        self._toolbar(f, [("⬇ Download to PC (Ctrl+D)", self.download_selected, 1),
-                          ("♻ Restore on server", self.restore_server_file), None,
-                          ("🗑 Delete from server", self.delete_selected)])
+        self._toolbar(f, [("â¬‡ Download to PC (Ctrl+D)", self.download_selected, 1),
+                          ("â™» Restore on server", self.restore_server_file), None,
+                          ("ðŸ—‘ Delete from server", self.delete_selected)])
         self.tree_files = self._tree(f, ("Date", "Size", "File"), (150, 110, 600), ("w", "e", "w"))
         self.tree_files.bind("<Double-1>", lambda _: self.download_selected())
         return f
 
     def _page_local(self):
         f, _ = self._page("Backups on this PC")
-        self._toolbar(f, [("📂 Open folder", self.open_folder, 1), ("⟳ Refresh", self.refresh_local), None,
-                          ("⬆ Upload & restore to Proxmox", self.restore_local_file), ("🗑 Delete", self.delete_local)])
+        self._toolbar(f, [("ðŸ“‚ Open folder", self.open_folder, 1), ("âŸ³ Refresh", self.refresh_local), None,
+                          ("â¬† Upload & restore to Proxmox", self.restore_local_file), ("ðŸ—‘ Delete", self.delete_local)])
         self.lbl_local = ttk.Label(f, text="", style="Muted.TLabel")
         self.lbl_local.pack(anchor="w", pady=(0, 6))
         self.tree_local = self._tree(f, ("Modified", "Size", "File"), (150, 110, 600), ("w", "e", "w"))
@@ -753,7 +783,7 @@ class App(tk.Tk):
         g.pack(fill="x")
         ttk.Label(g, text="Save backups in").grid(row=0, column=0, sticky="w", pady=5)
         ttk.Entry(g, textvariable=self.v_dir, width=56).grid(row=0, column=1, padx=8, sticky="w")
-        ttk.Button(g, text="Browse…", command=lambda: self.v_dir.set(filedialog.askdirectory() or self.v_dir.get())).grid(row=0, column=2)
+        ttk.Button(g, text="Browseâ€¦", command=lambda: self.v_dir.set(filedialog.askdirectory() or self.v_dir.get())).grid(row=0, column=2)
         ttk.Label(g, text="Back up every (days)").grid(row=1, column=0, sticky="w", pady=5)
         ttk.Spinbox(g, from_=1, to=60, textvariable=self.v_days, width=8).grid(row=1, column=1, sticky="w", padx=8)
         ttk.Label(g, text="Old backups to keep").grid(row=2, column=0, sticky="w", pady=5)
@@ -803,7 +833,7 @@ class App(tk.Tk):
         self.lbl_job.pack(anchor="w")
         self.lbl_detail = ttk.Label(mid, text="", style="Muted.TLabel")
         self.lbl_detail.pack(anchor="w")
-        self.btn_cancel = ttk.Button(top, text="✕ Cancel (Esc)", command=self.cancel.set, state="disabled")
+        self.btn_cancel = ttk.Button(top, text="âœ• Cancel (Esc)", command=self.cancel.set, state="disabled")
         self.btn_cancel.pack(side="right")
         self.pbar = ttk.Progressbar(p, maximum=100)
         self.pbar.pack(fill="x", pady=(6, 2))
@@ -822,7 +852,7 @@ class App(tk.Tk):
         else:
             self.pbar.config(mode="indeterminate")
             self.pbar.step(3)
-            self.lbl_pct.config(text="…")
+            self.lbl_pct.config(text="â€¦")
         parts = []
         if total:
             if pct is not None and done is None:
@@ -836,12 +866,12 @@ class App(tk.Tk):
             if total and pct:
                 left = (100 - pct) / pct * (time.time() - self.item_start)
                 parts.append(f"~{eta(left)} left")
-        self.lbl_detail.config(text="   •   ".join(parts))
+        self.lbl_detail.config(text="   â€¢   ".join(parts))
         if overall is not None and count:
             if not self.pbar_all.winfo_ismapped():
                 self.pbar_all.pack(fill="x", pady=(2, 0), before=self.logbox)
             self.pbar_all.config(value=overall)
-            self.lbl_overall.config(text=f"Overall: item {idx} of {count}  •  {overall:.0f}% of {human(self.job_total)}  •  "
+            self.lbl_overall.config(text=f"Overall: item {idx} of {count}  â€¢  {overall:.0f}% of {human(self.job_total)}  â€¢  "
                                          f"elapsed {eta(time.time() - self.job_start)}")
 
     # ---------- queue / threading
@@ -940,7 +970,7 @@ class App(tk.Tk):
             iid = f"{g['type']}:{g['id']}"
             run = g["status"] == "running"
             t.insert("", "end", iid=iid, tags=("running" if run else "stopped",), values=(
-                g["id"], g["name"], "VM" if g["type"] == "qemu" else "CT", ("● " if run else "○ ") + g["status"],
+                g["id"], g["name"], "VM" if g["type"] == "qemu" else "CT", ("â— " if run else "â—‹ ") + g["status"],
                 f"{g['cpu'] * 100:.0f}%" if run else "-",
                 f"{human(g['mem'])} / {human(g['maxmem'])}" if run else human(g["maxmem"]),
                 human(g["disk"]), duration(g["uptime"]) if run else "-", g["node"]))
@@ -957,7 +987,7 @@ class App(tk.Tk):
         cpu = st.get("cpu", 0) * 100
         mem = st.get("memory", {})
         rfs = st.get("rootfs", {})
-        self._stat("cpu", f"{cpu:.0f}%", f"{st.get('cpuinfo', {}).get('cpus', '?')} cores · load {', '.join(st.get('loadavg', [])[:1])}", cpu)
+        self._stat("cpu", f"{cpu:.0f}%", f"{st.get('cpuinfo', {}).get('cpus', '?')} cores Â· load {', '.join(st.get('loadavg', [])[:1])}", cpu)
         mp = mem.get("used", 0) * 100 / (mem.get("total") or 1)
         self._stat("mem", f"{mp:.0f}%", f"{human(mem.get('used'))} of {human(mem.get('total'))}", mp)
         dp = rfs.get("used", 0) * 100 / (rfs.get("total") or 1)
@@ -1046,8 +1076,8 @@ class App(tk.Tk):
             code, out, _ = self.pve.run("apt list --upgradable 2>/dev/null | tail -n +2", timeout=60)
             pk = [l.split("/")[0] for l in out.splitlines() if l.strip()]
             self.ui(messagebox.showinfo, APP_NAME, f"{len(pk)} package update(s) available (from the last apt update).\n\n"
-                    + "\n".join(pk[:25]) + ("\n…" if len(pk) > 25 else "")
-                    + "\n\nInstall them from the web UI: Node → Updates.")
+                    + "\n".join(pk[:25]) + ("\nâ€¦" if len(pk) > 25 else "")
+                    + "\n\nInstall them from the web UI: Node â†’ Updates.")
         self.bg(work)
 
     def node_power(self, cmd):
@@ -1079,26 +1109,49 @@ class App(tk.Tk):
                     self.log(f"{action} {g['id']}: {e}")
             time.sleep(3)
             return f"{action.capitalize()} sent to {len(gs)} guest(s)"
-        self.job(work, f"{action.capitalize()}…")
+        self.job(work, f"{action.capitalize()}â€¦")
 
     def _run_backup(self, guests):
         total = sum(g["disk"] for g in guests)
 
-        def prog(label, pct, got, speed, overall, idx, count, item_total):
+        def prog(label, pct, got, speed, overall, idx, count, item_total, status=None):
             if getattr(self, "_last_item", None) != idx:
                 self._last_item = idx
                 self.item_start = time.time()
-            self.ui(self.set_progress, f"Backing up {label}", pct, None, item_total, speed, overall, idx, count)
-            self.ui(self.lbl_detail.config, text=(f"{human(item_total * (pct or 0) / 100)} of {human(item_total)} read"
-                                                  f"   •   {human(got)} saved   •   {human(speed)}/s"
-                                                  + (f"   •   ~{eta((100 - pct) / pct * (time.time() - self.item_start))} left" if pct else "")))
+            if status == "waiting":
+                self.item_start = time.time()
+                title = f"Waiting: another backup is running on the server ({label})"
+                detail = "Proxmox runs one backup at a time. This one starts automatically when that finishes."
+            elif status == "starting" and not pct:
+                title, detail = f"Preparing {label}â€¦", "Taking snapshot and starting the backup"
+            else:
+                title = f"Backing up {label}"
+                detail = (f"{human(item_total * (pct or 0) / 100)} of {human(item_total)} read"
+                          f"   â€¢   {human(got)} saved   â€¢   {human(speed)}/s"
+                          + (f"   â€¢   ~{eta((100 - pct) / pct * (time.time() - self.item_start))} left" if pct else ""))
+            self.ui(self.set_progress, title, pct, None, item_total, speed, overall, idx, count)
+            self.ui(self.lbl_detail.config, text=detail)
         return total, prog
+
+    def _busy_on_server(self):
+        try:
+            jobs = self.pve.running_backups()
+        except Exception:
+            return False
+        if not jobs:
+            return False
+        return not messagebox.askyesno(
+            APP_NAME, "A backup is already running on this Proxmox server:\n\n" + "\n".join(jobs[:6]) +
+            "\n\nProxmox runs one backup at a time, so yours will wait in line until it finishes.\nStart anyway?",
+            icon="warning")
 
     def backup_selected(self):
         gs = self._selected()
         if not gs:
             self.show_page("guests")
             return messagebox.showinfo(APP_NAME, "Select one or more VMs first.")
+        if not self.busy and self._busy_on_server():
+            return
         total, prog = self._run_backup(gs)
         self.job(lambda: f"Backup done: {len(gs) - full_backup(self.pve, self.cfg, self.log, prog, self.cancel, gs)} of {len(gs)} OK",
                  f"Backing up {len(gs)} guest(s), {human(total)} of disks", total)
@@ -1108,9 +1161,11 @@ class App(tk.Tk):
         if not messagebox.askyesno(APP_NAME, f"Back up the host config and ALL {len(self.guests)} VMs/containers now?\n"
                                              f"Disk size to read: {human(total)}\nSaved to: {self.cfg['backup_dir']}"):
             return
+        if not self.busy and self._busy_on_server():
+            return
         _, prog = self._run_backup(self.guests)
         self.job(lambda: ("Full backup finished OK" if full_backup(self.pve, self.cfg, self.log, prog, self.cancel) == 0
-                          else "Full backup finished with failures (see log)"), "Full backup…", total)
+                          else "Full backup finished with failures (see log)"), "Full backupâ€¦", total)
 
     def open_snapshots(self):
         gs = self._selected()
@@ -1141,8 +1196,8 @@ class App(tk.Tk):
                             (base + d) * 100 / (total or 1), i, len(paths))
                 self.pve.download(p, str(dest_dir / name), prog, self.cancel)
                 base += self.file_sizes.get(p, 0)
-            return f"Downloaded {len(paths)} file(s), {human(total)} → {dest_dir}"
-        self.job(work, "Downloading…", total)
+            return f"Downloaded {len(paths)} file(s), {human(total)} â†’ {dest_dir}"
+        self.job(work, "Downloadingâ€¦", total)
 
     def delete_selected(self):
         paths = list(self.tree_files.selection())
@@ -1155,7 +1210,7 @@ class App(tk.Tk):
                 self.pve.run(f"rm -f {shlex.quote(p)} {shlex.quote(base + '.log')} {shlex.quote(p + '.notes')}")
                 self.log(f"Deleted {p}")
             return f"Deleted {len(paths)} file(s)"
-        self.job(work, "Deleting…")
+        self.job(work, "Deletingâ€¦")
 
     def _ask_restore(self, filename):
         is_ct = ".tar" in filename or "-lxc-" in filename
@@ -1186,7 +1241,7 @@ class App(tk.Tk):
             code, out, err = self.pve.run(self._restore_cmd(paths[0], *ans), timeout=86400)
             self.log((out + err).strip()[-800:])
             return f"Restored as {ans[1]}" if code == 0 else "Error: restore failed (see log)"
-        self.job(work, f"Restoring as ID {ans[1]}…")
+        self.job(work, f"Restoring as ID {ans[1]}â€¦")
 
     # ---------- local files
     def _local_root(self):
@@ -1208,7 +1263,7 @@ class App(tk.Tk):
             t.insert("", "end", iid=str(p), values=(datetime.fromtimestamp(s.st_mtime).strftime("%Y-%m-%d %H:%M"),
                                                      human(s.st_size), str(p.relative_to(root))))
         free = shutil.disk_usage(root).free
-        self.lbl_local.config(text=f"{len(files)} files · {human(total)} used · {human(free)} free on this drive · {root}")
+        self.lbl_local.config(text=f"{len(files)} files Â· {human(total)} used Â· {human(free)} free on this drive Â· {root}")
 
     def open_folder(self):
         root = self._local_root()
@@ -1243,12 +1298,12 @@ class App(tk.Tk):
             self.item_start = time.time()
             self.pve.upload(str(local), remote, lambda d, t, s: self.ui(self.set_progress, f"Uploading {local.name}",
                                                                         d * 100 / (t or 1), d, t, s), self.cancel)
-            self.ui(self.set_progress, f"Restoring as ID {ans[1]}…", None, None, None, None)
+            self.ui(self.set_progress, f"Restoring as ID {ans[1]}â€¦", None, None, None, None)
             code, out, err = self.pve.run(self._restore_cmd(remote, *ans), timeout=86400)
             self.log((out + err).strip()[-800:])
             self.pve.run(f"rm -f {shlex.quote(remote)}")
             return f"Restored as {ans[1]}" if code == 0 else "Error: restore failed (see log)"
-        self.job(work, "Uploading…", size)
+        self.job(work, "Uploadingâ€¦", size)
 
     # ---------- settings / auto
     def save_settings(self, quiet=False):
@@ -1264,9 +1319,9 @@ class App(tk.Tk):
     def update_auto_label(self):
         r = schtasks("/Query", "/TN", TASK_NAME, "/FO", "LIST")
         on = r.returncode == 0 and "--auto" in schtasks("/Query", "/TN", TASK_NAME, "/XML").stdout
-        self.lbl_auto.config(text=(f"● Enabled: every {self.cfg['every_days']} day(s) → {self.cfg['backup_dir']}" if on
-                                   else ("○ An older auto backup task exists. Click Enable to replace it." if r.returncode == 0
-                                         else "○ Auto backup is off")),
+        self.lbl_auto.config(text=(f"â— Enabled: every {self.cfg['every_days']} day(s) â†’ {self.cfg['backup_dir']}" if on
+                                   else ("â—‹ An older auto backup task exists. Click Enable to replace it." if r.returncode == 0
+                                         else "â—‹ Auto backup is off")),
                              foreground="#22c55e" if on else "#8b93a7")
 
     def enable_auto(self):
@@ -1313,17 +1368,17 @@ class SnapshotWindow(tk.Toplevel):
     def __init__(self, app, g):
         super().__init__(app)
         self.app, self.g = app, g
-        self.title(f"Snapshots · {g['id']} {g['name']}")
+        self.title(f"Snapshots Â· {g['id']} {g['name']}")
         self.geometry("640x420")
         self.transient(app)
         f = ttk.Frame(self, padding=14)
         f.pack(fill="both", expand=True)
         bar = ttk.Frame(f)
         bar.pack(fill="x", pady=(0, 8))
-        ttk.Button(bar, text="📷 Take snapshot", style="Accent.TButton", command=self.create).pack(side="left")
-        ttk.Button(bar, text="↺ Roll back", command=self.rollback).pack(side="left", padx=6)
-        ttk.Button(bar, text="🗑 Delete", command=self.delete).pack(side="left")
-        ttk.Button(bar, text="⟳", width=3, command=self.load).pack(side="right")
+        ttk.Button(bar, text="ðŸ“· Take snapshot", style="Accent.TButton", command=self.create).pack(side="left")
+        ttk.Button(bar, text="â†º Roll back", command=self.rollback).pack(side="left", padx=6)
+        ttk.Button(bar, text="ðŸ—‘ Delete", command=self.delete).pack(side="left")
+        ttk.Button(bar, text="âŸ³", width=3, command=self.load).pack(side="right")
         self.tree = app._tree(f, ("Name", "Date", "Description"), (160, 150, 280))
         self.status = ttk.Label(f, text="", style="Muted.TLabel")
         self.status.pack(anchor="w", pady=(6, 0))
@@ -1365,18 +1420,18 @@ class SnapshotWindow(tk.Toplevel):
                                       initialvalue=datetime.now().strftime("snap_%Y%m%d_%H%M"), parent=self)
         if name:
             desc = simpledialog.askstring(APP_NAME, "Description (optional):", parent=self) or ""
-            self._bg(lambda: self.app.pve.snapshot_create(self.g, name, desc), "Taking snapshot…")
+            self._bg(lambda: self.app.pve.snapshot_create(self.g, name, desc), "Taking snapshotâ€¦")
 
     def rollback(self):
         n = self._sel()
         if n and messagebox.askyesno(APP_NAME, f"Roll back {self.g['name']} to '{n}'?\nChanges after it will be lost.",
                                      icon="warning", parent=self):
-            self._bg(lambda: self.app.pve.snapshot_rollback(self.g, n), "Rolling back…")
+            self._bg(lambda: self.app.pve.snapshot_rollback(self.g, n), "Rolling backâ€¦")
 
     def delete(self):
         n = self._sel()
         if n and messagebox.askyesno(APP_NAME, f"Delete snapshot '{n}'?", parent=self):
-            self._bg(lambda: self.app.pve.snapshot_delete(self.g, n), "Deleting…")
+            self._bg(lambda: self.app.pve.snapshot_delete(self.g, n), "Deletingâ€¦")
 
 
 if __name__ == "__main__":
